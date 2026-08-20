@@ -185,10 +185,19 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, geometry_embeddings=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        geometry_embeddings: optional [B, G, width] tensor (already projected to
+        PaliGemma's hidden width and, if the caller applies a gate, already
+        gated -- this method does no gating itself, mirroring how
+        hj_geometry's OpenVLA integration keeps the gate in the caller-side
+        adapter, not in the patched forward()). When given, appended as an
+        extra block in the prefix sequence with the same full-attention
+        (att_mask=0) semantics as the image/language blocks, so it's treated
+        as additional context the whole prefix can attend to.
         """
         embs = []
         pad_masks = []
@@ -209,6 +218,12 @@ class PI0Pytorch(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        if geometry_embeddings is not None:
+            geo_bsize, num_geo_embs = geometry_embeddings.shape[:2]
+            embs.append(geometry_embeddings)
+            pad_masks.append(torch.ones(geo_bsize, num_geo_embs, dtype=torch.bool, device=geometry_embeddings.device))
+            att_masks += [0] * num_geo_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -314,7 +329,7 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None, geometry_embeddings=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
@@ -328,7 +343,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, geometry_embeddings=geometry_embeddings
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -374,7 +391,7 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, geometry_embeddings=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -383,7 +400,9 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, geometry_embeddings=geometry_embeddings
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
